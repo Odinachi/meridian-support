@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import logging
 import re
+import time
 
+from meridian.auth_audit import email_domain_only
 from meridian.mcp_client import tool_result_text
 from meridian.mcp_guard import call_tool_sync_guarded
+from meridian.observability import get_trace_id, log_tool_event
 from meridian.principal import CustomerPrincipal
+
+_LOG = logging.getLogger("meridian.auth")
 
 
 class AuthError(Exception):
@@ -72,10 +78,42 @@ def verify_customer_pin(email: str, pin: str) -> CustomerPrincipal:
 
     This is the only MCP path allowed without an existing customer session (see `mcp_guard`).
     """
-    validate_pin_format(pin)
+    t0 = time.perf_counter()
+    trace = get_trace_id()
+
+    try:
+        validate_pin_format(pin)
+    except AuthError:
+        log_tool_event(
+            _LOG,
+            logging.INFO,
+            "auth.verify.input_rejected",
+            tool="verify_customer_pin",
+            duration_ms=(time.perf_counter() - t0) * 1000,
+            extra_fields={"trace": trace, "reason": "pin_format"},
+        )
+        raise
+
     normalized = normalize_email(email)
     if not normalized or "@" not in normalized:
+        log_tool_event(
+            _LOG,
+            logging.INFO,
+            "auth.verify.input_rejected",
+            tool="verify_customer_pin",
+            duration_ms=(time.perf_counter() - t0) * 1000,
+            extra_fields={"trace": trace, "reason": "email_shape"},
+        )
         raise AuthError("That doesn't look like a complete email address.")
+
+    domain = email_domain_only(normalized)
+    log_tool_event(
+        _LOG,
+        logging.INFO,
+        "auth.verify.mcp_call",
+        tool="verify_customer_pin",
+        extra_fields={"trace": trace, "email_domain": domain},
+    )
 
     try:
         result = call_tool_sync_guarded(
@@ -84,12 +122,62 @@ def verify_customer_pin(email: str, pin: str) -> CustomerPrincipal:
             acting_customer_id=None,
         )
     except Exception as exc:  # noqa: BLE001 — surface to UI, log in production
+        log_tool_event(
+            _LOG,
+            logging.ERROR,
+            "auth.verify.transport_error",
+            tool="verify_customer_pin",
+            duration_ms=(time.perf_counter() - t0) * 1000,
+            extra_fields={"trace": trace, "email_domain": domain, "exc_type": type(exc).__name__},
+        )
+        _LOG.exception("verify_customer_pin MCP transport failed")
         raise AuthError("We couldn't reach Meridian sign-in. Try again shortly.") from exc
 
     text = tool_result_text(result)
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+
     if result.isError or "Error executing tool" in text:
         if "Customer not found" in text or "PIN incorrect" in text:
+            log_tool_event(
+                _LOG,
+                logging.INFO,
+                "auth.verify.failed_credentials",
+                tool="verify_customer_pin",
+                duration_ms=elapsed_ms,
+                extra_fields={"trace": trace, "email_domain": domain},
+            )
             raise AuthError("Email or PIN didn't match. Try again.")
+        log_tool_event(
+            _LOG,
+            logging.WARNING,
+            "auth.verify.mcp_error",
+            tool="verify_customer_pin",
+            duration_ms=elapsed_ms,
+            extra_fields={"trace": trace, "email_domain": domain},
+        )
         raise AuthError(text or "Sign-in didn't go through.")
 
-    return _parse_customer_block(text, normalized)
+    try:
+        principal = _parse_customer_block(text, normalized)
+    except AuthResponseParseError:
+        log_tool_event(
+            _LOG,
+            logging.ERROR,
+            "auth.verify.parse_failed",
+            tool="verify_customer_pin",
+            duration_ms=elapsed_ms,
+            extra_fields={"trace": trace, "email_domain": domain},
+        )
+        raise
+
+    suffix = principal.customer_id[-8:] if len(principal.customer_id) >= 8 else principal.customer_id
+    log_tool_event(
+        _LOG,
+        logging.INFO,
+        "auth.verify.success",
+        tool="verify_customer_pin",
+        duration_ms=elapsed_ms,
+        customer_id_suffix=suffix,
+        extra_fields={"trace": trace, "email_domain": domain},
+    )
+    return principal

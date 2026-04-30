@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 
 import streamlit as st
 
 from meridian.auth_agent import MeridianAuthContext, run_auth_agent_turn
-from meridian.mcp_client import tool_result_text
-from meridian.mcp_guard import MCPAuthRequired, call_tool_sync_guarded
+from meridian.auth_audit import email_domain_only
+from meridian.mcp_guard import MCPAuthRequired
 from meridian.logout_intent import looks_like_logout_request, parse_logout_confirmation
+from meridian.observability import configure_logging, log_tool_event, new_trace_id, trace_scope
 from meridian.principal import (
     principal_from_session_dict,
     principal_to_session_dict,
@@ -26,6 +28,8 @@ except ImportError:
 
 load_dotenv()
 
+_LOG = logging.getLogger("meridian.app")
+
 SESSION_CUSTOMER = "meridian_authenticated_customer"
 SESSION_AUTH_MESSAGES = "meridian_auth_chat_messages"
 SESSION_AUTH_CONTEXT = "meridian_auth_context"
@@ -33,10 +37,19 @@ SESSION_LOGOUT_PENDING = "meridian_logout_confirm_pending"
 
 
 def _perform_sign_out():
-    st.session_state[SESSION_CUSTOMER] = None
-    st.session_state[SESSION_LOGOUT_PENDING] = False
-    st.session_state.messages = []
-    _reset_auth_state()
+    with trace_scope(new_trace_id()):
+        had_customer = bool(st.session_state.get(SESSION_CUSTOMER))
+        log_tool_event(
+            _LOG,
+            logging.INFO,
+            "auth.session.sign_out",
+            tool="session",
+            extra_fields={"had_customer": had_customer},
+        )
+        st.session_state[SESSION_CUSTOMER] = None
+        st.session_state[SESSION_LOGOUT_PENDING] = False
+        st.session_state.messages = []
+        _reset_auth_state()
 
 
 def stream_text(text: str, chunk_chars: int = 8):
@@ -65,17 +78,25 @@ def _reset_auth_state():
 
 
 def mock_reply(customer_id: str) -> str:
-    """Demo support reply; MCP calls go only through the guarded client."""
+    """Demo support reply; catalog via guarded ``list_products`` wrapper."""
+    from meridian.tools.list_products import (
+        ListProductsMCPError,
+        ListProductsValidationError,
+        fetch_list_products,
+    )
+
     try:
-        inv = tool_result_text(
-            call_tool_sync_guarded(
-                "list_products",
-                {"is_active": True},
-                acting_customer_id=customer_id,
-            )
+        inv = fetch_list_products(
+            acting_customer_id=customer_id,
+            category=None,
+            is_active=None,
         )
         inv_preview = inv[:900] + ("…" if len(inv) > 900 else "")
+    except ListProductsValidationError as exc:
+        inv_preview = str(exc)
     except MCPAuthRequired as exc:
+        inv_preview = str(exc)
+    except ListProductsMCPError as exc:
         inv_preview = str(exc)
     except Exception as exc:  # noqa: BLE001
         inv_preview = f"Couldn't load inventory ({type(exc).__name__})."
@@ -120,35 +141,50 @@ def _render_auth_chat():
     ctx: MeridianAuthContext = st.session_state[SESSION_AUTH_CONTEXT]
 
     if prompt := st.chat_input("Message…", key="meridian_auth_chat_input"):
-        st.session_state[SESSION_AUTH_MESSAGES].append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
+        with trace_scope(new_trace_id()):
+            st.session_state[SESSION_AUTH_MESSAGES].append({"role": "user", "content": prompt})
+            with st.chat_message("user"):
+                st.markdown(prompt)
 
-        try:
-            reply = run_auth_agent_turn(
-                st.session_state[SESSION_AUTH_MESSAGES],
-                context=ctx,
-            )
-        except RuntimeError as exc:
-            reply = f"Setup issue: {exc}"
-        except Exception as exc:  # noqa: BLE001
-            reply = f"Something went wrong ({type(exc).__name__}). Try again in a moment."
+            try:
+                reply = run_auth_agent_turn(
+                    st.session_state[SESSION_AUTH_MESSAGES],
+                    context=ctx,
+                )
+            except RuntimeError as exc:
+                reply = f"Setup issue: {exc}"
+            except Exception as exc:  # noqa: BLE001
+                reply = f"Something went wrong ({type(exc).__name__}). Try again in a moment."
 
-        st.session_state[SESSION_AUTH_MESSAGES].append({"role": "assistant", "content": reply})
-        with st.chat_message("assistant"):
-            st.markdown(reply)
+            st.session_state[SESSION_AUTH_MESSAGES].append({"role": "assistant", "content": reply})
+            with st.chat_message("assistant"):
+                st.markdown(reply)
 
-        principal = ctx.pending_principal
-        if principal is not None:
-            st.session_state[SESSION_CUSTOMER] = principal_to_session_dict(principal)
-            ctx.pending_principal = None
-            st.session_state.messages = []
-            st.session_state[SESSION_AUTH_MESSAGES] = []
-            st.success("Verified. Opening support…")
-            st.rerun()
+            principal = ctx.pending_principal
+            if principal is not None:
+                suffix = (
+                    principal.customer_id[-8:]
+                    if len(principal.customer_id) >= 8
+                    else principal.customer_id
+                )
+                log_tool_event(
+                    _LOG,
+                    logging.INFO,
+                    "auth.session.established",
+                    tool="session",
+                    customer_id_suffix=suffix,
+                    extra_fields={"email_domain": email_domain_only(principal.email)},
+                )
+                st.session_state[SESSION_CUSTOMER] = principal_to_session_dict(principal)
+                ctx.pending_principal = None
+                st.session_state.messages = []
+                st.session_state[SESSION_AUTH_MESSAGES] = []
+                st.success("Verified. Opening support…")
+                st.rerun()
 
 
 def main():
+    configure_logging()
     os.environ.setdefault(
         "MCP_SERVER_URL",
         "https://order-mcp-74afyau24q-uc.a.run.app/mcp",
@@ -180,41 +216,42 @@ def main():
                 st.markdown(message["content"])
 
         if prompt := st.chat_input("How can we help?"):
-            st.session_state.messages.append({"role": "user", "content": prompt})
-            with st.chat_message("user"):
-                st.markdown(prompt)
+            with trace_scope(new_trace_id()):
+                st.session_state.messages.append({"role": "user", "content": prompt})
+                with st.chat_message("user"):
+                    st.markdown(prompt)
 
-            if st.session_state[SESSION_LOGOUT_PENDING]:
-                decision = parse_logout_confirmation(prompt)
-                if decision == "yes":
-                    reply = "You're signed out. When you're ready, sign in again from here."
-                    st.session_state.messages.append({"role": "assistant", "content": reply})
-                    with st.chat_message("assistant"):
-                        st.write_stream(stream_text(reply))
-                    _perform_sign_out()
-                    st.rerun()
-                elif decision == "no":
-                    st.session_state[SESSION_LOGOUT_PENDING] = False
-                    reply = "Understood—you're still signed in. What else do you need?"
+                if st.session_state[SESSION_LOGOUT_PENDING]:
+                    decision = parse_logout_confirmation(prompt)
+                    if decision == "yes":
+                        reply = "You're signed out. When you're ready, sign in again from here."
+                        st.session_state.messages.append({"role": "assistant", "content": reply})
+                        with st.chat_message("assistant"):
+                            st.write_stream(stream_text(reply))
+                        _perform_sign_out()
+                        st.rerun()
+                    elif decision == "no":
+                        st.session_state[SESSION_LOGOUT_PENDING] = False
+                        reply = "Understood—you're still signed in. What else do you need?"
+                        with st.chat_message("assistant"):
+                            st.write_stream(stream_text(reply))
+                        st.session_state.messages.append({"role": "assistant", "content": reply})
+                    else:
+                        reply = "Sign out—yes or no?"
+                        with st.chat_message("assistant"):
+                            st.write_stream(stream_text(reply))
+                        st.session_state.messages.append({"role": "assistant", "content": reply})
+                elif looks_like_logout_request(prompt):
+                    st.session_state[SESSION_LOGOUT_PENDING] = True
+                    reply = "End this session? Reply yes to sign out, or no to stay."
                     with st.chat_message("assistant"):
                         st.write_stream(stream_text(reply))
                     st.session_state.messages.append({"role": "assistant", "content": reply})
                 else:
-                    reply = "Sign out—yes or no?"
+                    reply = mock_reply(customer.customer_id)
                     with st.chat_message("assistant"):
                         st.write_stream(stream_text(reply))
                     st.session_state.messages.append({"role": "assistant", "content": reply})
-            elif looks_like_logout_request(prompt):
-                st.session_state[SESSION_LOGOUT_PENDING] = True
-                reply = "End this session? Reply yes to sign out, or no to stay."
-                with st.chat_message("assistant"):
-                    st.write_stream(stream_text(reply))
-                st.session_state.messages.append({"role": "assistant", "content": reply})
-            else:
-                reply = mock_reply(customer.customer_id)
-                with st.chat_message("assistant"):
-                    st.write_stream(stream_text(reply))
-                st.session_state.messages.append({"role": "assistant", "content": reply})
         return
 
     _sidebar_auth_gate()

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import logging
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -12,7 +14,11 @@ from agents.run_context import RunContextWrapper
 from agents.tool import function_tool
 
 from meridian.auth import AuthError, verify_customer_pin
+from meridian.auth_audit import email_domain_only
+from meridian.observability import get_trace_id, log_tool_event
 from meridian.principal import CustomerPrincipal
+
+_LOG = logging.getLogger("meridian.auth_agent")
 
 
 @dataclass
@@ -49,15 +55,46 @@ def submit_meridian_credentials(
     account_password: str,
 ) -> str:
     """Verify email and 4-digit PIN with the Meridian order service."""
+    trace = get_trace_id()
+    domain = email_domain_only(email)
+    log_tool_event(
+        _LOG,
+        logging.INFO,
+        "auth.agent.credential_tool",
+        tool="submit_meridian_credentials",
+        extra_fields={"trace": trace, "phase": "invoke", "email_domain": domain},
+    )
     try:
         principal = verify_customer_pin(email, account_password)
     except AuthError as exc:
         ctx.context.pending_principal = None
+        log_tool_event(
+            _LOG,
+            logging.INFO,
+            "auth.agent.credential_tool",
+            tool="submit_meridian_credentials",
+            extra_fields={
+                "trace": trace,
+                "phase": "auth_error",
+                "email_domain": domain,
+                "error_type": type(exc).__name__,
+            },
+        )
         msg = f"VERIFICATION_FAILED: {exc}"
         ctx.context.last_tool_user_visible = msg
         return msg
 
     ctx.context.pending_principal = principal
+    log_tool_event(
+        _LOG,
+        logging.INFO,
+        "auth.agent.credential_tool",
+        tool="submit_meridian_credentials",
+        customer_id_suffix=principal.customer_id[-8:]
+        if len(principal.customer_id) >= 8
+        else principal.customer_id,
+        extra_fields={"trace": trace, "phase": "success", "email_domain": domain},
+    )
     ok = (
         f"VERIFICATION_OK: {principal.display_name} is verified. "
         "One short welcome—they’re about to use main support."
@@ -96,6 +133,18 @@ def run_auth_agent_turn(
     The last message should be the latest user turn; include prior user/assistant
     strings so the model retains context (no separate DB session required).
     """
+    t0 = time.perf_counter()
+    trace = get_trace_id()
+    log_tool_event(
+        _LOG,
+        logging.INFO,
+        "auth.agent.turn.start",
+        tool="MeridianSignIn",
+        extra_fields={
+            "trace": trace,
+            "message_count": len(conversation),
+        },
+    )
     require_openai_key()
     agent = build_auth_agent()
     result = Runner.run_sync(
@@ -105,4 +154,17 @@ def run_auth_agent_turn(
         max_turns=16,
     )
     out = result.final_output
-    return out if isinstance(out, str) else str(out)
+    text = out if isinstance(out, str) else str(out)
+    log_tool_event(
+        _LOG,
+        logging.INFO,
+        "auth.agent.turn.done",
+        tool="MeridianSignIn",
+        duration_ms=(time.perf_counter() - t0) * 1000,
+        extra_fields={
+            "trace": trace,
+            "reply_chars": len(text),
+            "pending_verified": context.pending_principal is not None,
+        },
+    )
+    return text
