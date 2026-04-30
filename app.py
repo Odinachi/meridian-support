@@ -64,7 +64,7 @@ def _reset_auth_state():
     st.session_state[SESSION_AUTH_CONTEXT] = MeridianAuthContext()
 
 
-def mock_reply(user_text: str, customer_id: str) -> str:
+def mock_reply(customer_id: str) -> str:
     """Demo support reply; MCP calls go only through the guarded client."""
     try:
         inv = tool_result_text(
@@ -78,21 +78,21 @@ def mock_reply(user_text: str, customer_id: str) -> str:
     except MCPAuthRequired as exc:
         inv_preview = str(exc)
     except Exception as exc:  # noqa: BLE001
-        inv_preview = f"Inventory call failed ({type(exc).__name__}): {exc}"
+        inv_preview = f"Couldn't load inventory ({type(exc).__name__})."
 
     return (
-        f"**Your message:** {user_text[:280]}{'…' if len(user_text) > 280 else ''}\n\n"
-        "**Active products (first chunk via MCP, gated by session):**\n\n"
+        "We're not answering end-to-end yet—this build still routes through a demo path. "
+        "Here's a current slice of **in-stock catalog** so you can see live data behind the session:\n\n"
         f"```text\n{inv_preview}\n```"
     )
 
 
 def _sidebar_signed_in(customer):
     st.sidebar.header("Account")
-    st.sidebar.success(f"Signed in as **{customer.display_name}**")
+    st.sidebar.success(f"**{customer.display_name}**")
     st.sidebar.caption(customer.email)
-    with st.sidebar.expander("Profile from MCP"):
-        st.markdown(customer.details_text or "_No detail text stored._")
+    with st.sidebar.expander("Account details"):
+        st.markdown(customer.details_text or "No profile text returned.")
     if st.sidebar.button("Sign out", type="secondary"):
         _perform_sign_out()
         st.rerun()
@@ -100,30 +100,26 @@ def _sidebar_signed_in(customer):
 
 def _sidebar_auth_gate():
     st.sidebar.header("Account")
-    st.sidebar.markdown(
-        "The **AI sign-in assistant** (OpenAI Agents) will ask for your **email** and "
-        "**4-digit account PIN** (Meridian stores a numeric PIN; you may call it a password). "
-        "No catalog or order MCP calls run until verification succeeds."
-    )
+  
     if not (os.environ.get("OPENAI_API_KEY") or "").strip():
-        st.sidebar.warning("Set **OPENAI_API_KEY** in `.env` or the environment to enable sign-in.")
+        st.sidebar.warning("Add `OPENAI_API_KEY` to `.env` to turn on chat-based sign-in.")
 
 
 def _render_auth_chat():
-    st.subheader("Sign in with the assistant")
-    st.caption("Chat below — the agent will guide you and call Meridian verification when ready.")
+    st.subheader("Sign in")
+    st.caption("Use the chat—same flow you'd expect from a support line, without the hold music.")
 
     for msg in st.session_state[SESSION_AUTH_MESSAGES]:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
     if not (os.environ.get("OPENAI_API_KEY") or "").strip():
-        st.error("Add **OPENAI_API_KEY** to use the sign-in agent.")
+        st.error("Chat sign-in is off until `OPENAI_API_KEY` is set in your environment.")
         return
 
     ctx: MeridianAuthContext = st.session_state[SESSION_AUTH_CONTEXT]
 
-    if prompt := st.chat_input("Talk to the sign-in assistant…", key="meridian_auth_chat_input"):
+    if prompt := st.chat_input("Message…", key="meridian_auth_chat_input"):
         st.session_state[SESSION_AUTH_MESSAGES].append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
@@ -134,9 +130,9 @@ def _render_auth_chat():
                 context=ctx,
             )
         except RuntimeError as exc:
-            reply = f"**Configuration error:** {exc}"
+            reply = f"Setup issue: {exc}"
         except Exception as exc:  # noqa: BLE001
-            reply = f"**Sign-in assistant error:** {type(exc).__name__}: {exc}"
+            reply = f"Something went wrong ({type(exc).__name__}). Try again in a moment."
 
         st.session_state[SESSION_AUTH_MESSAGES].append({"role": "assistant", "content": reply})
         with st.chat_message("assistant"):
@@ -148,14 +144,14 @@ def _render_auth_chat():
             ctx.pending_principal = None
             st.session_state.messages = []
             st.session_state[SESSION_AUTH_MESSAGES] = []
-            st.success("You’re signed in. Loading support chat…")
+            st.success("Verified. Opening support…")
             st.rerun()
 
 
 def main():
     os.environ.setdefault(
         "MCP_SERVER_URL",
-        "",
+        "https://order-mcp-74afyau24q-uc.a.run.app/mcp",
     )
     st.set_page_config(
         page_title="Meridian Support",
@@ -170,20 +166,20 @@ def main():
     if st.session_state.get(SESSION_CUSTOMER):
         customer = principal_from_session_dict(st.session_state[SESSION_CUSTOMER])
 
-    st.title("Meridian Electronics — support")
-    st.caption("OpenAI Agents for sign-in; MCP calls require a verified customer session.")
+    st.title("Meridian support")
+    st.caption("Electronics orders & account help—sign in first, then ask anything.")
 
     if customer is not None:
         _sidebar_signed_in(customer)
-        st.success(f"Session active for **{customer.display_name}**.")
-        with st.expander("Customer id (for support logs)"):
+        st.success(f"**{customer.display_name}** — you're in.")
+        with st.expander("Reference ID (for tickets)"):
             st.code(customer.customer_id)
 
         for message in st.session_state.messages:
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
 
-        if prompt := st.chat_input("Ask about products, orders, or shipping…"):
+        if prompt := st.chat_input("How can we help?"):
             st.session_state.messages.append({"role": "user", "content": prompt})
             with st.chat_message("user"):
                 st.markdown(prompt)
@@ -191,7 +187,7 @@ def main():
             if st.session_state[SESSION_LOGOUT_PENDING]:
                 decision = parse_logout_confirmation(prompt)
                 if decision == "yes":
-                    reply = "Signing you out now. You can sign in again anytime from this page."
+                    reply = "You're signed out. When you're ready, sign in again from here."
                     st.session_state.messages.append({"role": "assistant", "content": reply})
                     with st.chat_message("assistant"):
                         st.write_stream(stream_text(reply))
@@ -199,29 +195,23 @@ def main():
                     st.rerun()
                 elif decision == "no":
                     st.session_state[SESSION_LOGOUT_PENDING] = False
-                    reply = "Okay — you’re still signed in. How else can I help?"
+                    reply = "Understood—you're still signed in. What else do you need?"
                     with st.chat_message("assistant"):
                         st.write_stream(stream_text(reply))
                     st.session_state.messages.append({"role": "assistant", "content": reply})
                 else:
-                    reply = (
-                        "I didn’t catch that. Do you want to **sign out**? "
-                        "Reply **yes** to log out or **no** to stay signed in."
-                    )
+                    reply = "Sign out—yes or no?"
                     with st.chat_message("assistant"):
                         st.write_stream(stream_text(reply))
                     st.session_state.messages.append({"role": "assistant", "content": reply})
             elif looks_like_logout_request(prompt):
                 st.session_state[SESSION_LOGOUT_PENDING] = True
-                reply = (
-                    "Do you want to **sign out** of Meridian support? "
-                    "Reply **yes** to confirm or **no** to stay signed in."
-                )
+                reply = "End this session? Reply yes to sign out, or no to stay."
                 with st.chat_message("assistant"):
                     st.write_stream(stream_text(reply))
                 st.session_state.messages.append({"role": "assistant", "content": reply})
             else:
-                reply = mock_reply(prompt, customer.customer_id)
+                reply = mock_reply(customer.customer_id)
                 with st.chat_message("assistant"):
                     st.write_stream(stream_text(reply))
                 st.session_state.messages.append({"role": "assistant", "content": reply})

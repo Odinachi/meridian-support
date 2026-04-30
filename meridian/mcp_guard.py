@@ -27,7 +27,6 @@ def call_tool_sync_guarded(
     """
     if tool_name not in _TOOLS_WITHOUT_CUSTOMER and not (acting_customer_id or "").strip():
         raise MCPAuthRequired(
-            "You must complete email and account PIN verification before "
-            "this assistant can access Meridian orders, products, or inventory."
+            "Sign in first—then we can open orders, products, and inventory."
         )
     return call_tool_sync(tool_name, arguments)

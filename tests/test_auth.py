@@ -76,7 +76,7 @@ def test_verify_customer_pin_maps_mcp_failure(monkeypatch):
         )
 
     monkeypatch.setattr("meridian.auth.call_tool_sync_guarded", fake_guarded)
-    with pytest.raises(AuthError, match="Email or PIN"):
+    with pytest.raises(AuthError, match="didn't match"):
         verify_customer_pin("any@example.com", "1234")
 
 

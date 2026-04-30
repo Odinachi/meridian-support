@@ -28,7 +28,7 @@ def normalize_email(email: str) -> str:
 
 def validate_pin_format(pin: str) -> None:
     if not re.fullmatch(r"\d{4}", pin or ""):
-        raise AuthError("PIN must be exactly 4 digits.")
+        raise AuthError("PIN should be four digits—numbers only.")
 
 
 def _parse_customer_block(text: str, fallback_email: str) -> CustomerPrincipal:
@@ -42,8 +42,7 @@ def _parse_customer_block(text: str, fallback_email: str) -> CustomerPrincipal:
             customer_id = matches[0].lower()
     if not customer_id:
         raise AuthResponseParseError(
-            "Sign-in succeeded but the response did not include a customer id. "
-            "Contact engineering with the request timestamp."
+            "Sign-in worked, but we couldn’t read your account id. Contact Meridian IT with the time you tried."
         )
 
     display_name = ""
@@ -76,7 +75,7 @@ def verify_customer_pin(email: str, pin: str) -> CustomerPrincipal:
     validate_pin_format(pin)
     normalized = normalize_email(email)
     if not normalized or "@" not in normalized:
-        raise AuthError("Enter a valid email address.")
+        raise AuthError("That doesn't look like a complete email address.")
 
     try:
         result = call_tool_sync_guarded(
@@ -85,12 +84,12 @@ def verify_customer_pin(email: str, pin: str) -> CustomerPrincipal:
             acting_customer_id=None,
         )
     except Exception as exc:  # noqa: BLE001 — surface to UI, log in production
-        raise AuthError(f"Could not reach sign-in service ({type(exc).__name__}).") from exc
+        raise AuthError("We couldn't reach Meridian sign-in. Try again shortly.") from exc
 
     text = tool_result_text(result)
     if result.isError or "Error executing tool" in text:
         if "Customer not found" in text or "PIN incorrect" in text:
-            raise AuthError("Email or PIN is incorrect.")
-        raise AuthError(text or "Sign-in failed.")
+            raise AuthError("Email or PIN didn't match. Try again.")
+        raise AuthError(text or "Sign-in didn't go through.")
 
     return _parse_customer_block(text, normalized)

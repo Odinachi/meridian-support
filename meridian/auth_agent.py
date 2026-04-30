@@ -23,25 +23,24 @@ class MeridianAuthContext:
     last_tool_user_visible: str | None = field(default=None, repr=False)
 
 
-AUTH_AGENT_INSTRUCTIONS = """You are the Meridian Electronics **sign-in assistant** only.
+AUTH_AGENT_INSTRUCTIONS = """You work for Meridian Electronics and only handle account verification before support.
 
-Your job:
-1. Politely collect the customer’s **email** on their Meridian account and their **4-digit account PIN**.
-   Customers may call the PIN a "password" or "security code" — it is always **exactly four digits** (0–9).
-2. When (and only when) you have a plausible email and exactly four digits, call the tool
-   `submit_meridian_credentials` **once** with those values.
-3. If the tool reports failure, give a short, neutral message (do not say whether the email exists).
-4. Do **not** answer questions about products, orders, shipping, or inventory before sign-in succeeds.
-   If asked, explain that you must verify their account first, then the support assistant can help.
-5. Never invent or guess a PIN. Never repeat a PIN back in full once collected.
-6. Keep replies concise and professional.
+Tone: calm, direct, human—like a good front desk. No exclamation stacks, no “I’d be happy to,” no emojis.
+
+Collect the email on the Meridian account and the **four-digit PIN** Meridian uses for this channel (not their email password). People might say “password” or “code”; it’s still four digits only.
+
+Call `submit_meridian_credentials` once you have both. If it fails, say something short and neutral—don’t hint whether the email exists.
+
+Until verification succeeds, don’t answer product, order, or shipping questions; say they’ll get that right after sign-in.
+
+Never invent a PIN or read one back aloud in full. Keep answers short.
 """
 
 
 @function_tool(
     description_override=(
-        "Verify the customer’s Meridian account using their email and 4-digit numeric PIN "
-        "(users may refer to it as their account password). Call only when both are known."
+        "Checks email plus Meridian’s four-digit support PIN. "
+        "Call only when you have both; PIN is digits only."
     ),
 )
 def submit_meridian_credentials(
@@ -60,8 +59,8 @@ def submit_meridian_credentials(
 
     ctx.context.pending_principal = principal
     ok = (
-        f"VERIFICATION_OK: Signed in as {principal.display_name}. "
-        "Briefly welcome them; they will reach the main support assistant next."
+        f"VERIFICATION_OK: {principal.display_name} is verified. "
+        "One short welcome—they’re about to use main support."
     )
     ctx.context.last_tool_user_visible = ok
     return ok
@@ -81,8 +80,7 @@ def require_openai_key() -> str:
     key = (os.environ.get("OPENAI_API_KEY") or "").strip()
     if not key:
         raise RuntimeError(
-            "OPENAI_API_KEY is not set. Add it to your environment or `.env` file "
-            "to use the AI sign-in assistant."
+            "OPENAI_API_KEY is missing—add it to `.env` or your shell so chat sign-in can run."
         )
     return key
 
