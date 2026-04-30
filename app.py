@@ -93,8 +93,24 @@ def _skus_from_user_message(text: str, *, limit: int = 3) -> list[str]:
     return out
 
 
+def _search_query_candidate(text: str) -> str | None:
+    """
+    Derive a catalog search string from the user message.
+
+    SKU tokens are removed when other words remain so searches lean on product language;
+    if the message is only SKUs, the raw text is still used (partial name match on server).
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    sans_skus = _SKU_IN_MESSAGE.sub(" ", raw)
+    sans_skus = " ".join(sans_skus.split()).strip()
+    candidate = sans_skus if sans_skus else raw
+    return candidate[:200] if candidate else None
+
+
 def mock_reply(customer_id: str, user_message: str = "") -> str:
-    """Demo support reply: optional ``get_product`` by SKU from the message, plus ``list_products``."""
+    """Demo reply: ``get_product`` for SKUs, ``search_products`` for text, ``list_products`` snapshot."""
     from meridian.tools.get_product import (
         GetProductMCPError,
         GetProductNotFoundError,
@@ -105,6 +121,11 @@ def mock_reply(customer_id: str, user_message: str = "") -> str:
         ListProductsMCPError,
         ListProductsValidationError,
         fetch_list_products,
+    )
+    from meridian.tools.search_products import (
+        SearchProductsMCPError,
+        SearchProductsValidationError,
+        fetch_search_products,
     )
 
     sku_blocks: list[str] = []
@@ -121,6 +142,25 @@ def mock_reply(customer_id: str, user_message: str = "") -> str:
             sku_blocks.append(f"**{sku}** — {exc}")
         except MCPAuthRequired as exc:
             sku_blocks.append(f"**{sku}** — {exc}")
+
+    search_block = ""
+    sq = _search_query_candidate(user_message)
+    if sq:
+        try:
+            hits = fetch_search_products(acting_customer_id=customer_id, query=sq)
+            clip = hits[:3500] + ("…" if len(hits) > 3500 else "")
+            search_block = (
+                f"**Search** (\"{sq[:80]}{'…' if len(sq) > 80 else ''}\")\n\n"
+                f"```text\n{clip}\n```\n\n---\n\n"
+            )
+        except SearchProductsValidationError as exc:
+            search_block = f"**Search** — {exc}\n\n---\n\n"
+        except MCPAuthRequired as exc:
+            search_block = f"**Search** — {exc}\n\n---\n\n"
+        except SearchProductsMCPError as exc:
+            search_block = f"**Search** — {exc}\n\n---\n\n"
+        except Exception as exc:  # noqa: BLE001
+            search_block = f"**Search** — {type(exc).__name__}\n\n---\n\n"
 
     try:
         inv = fetch_list_products(
@@ -146,7 +186,7 @@ def mock_reply(customer_id: str, user_message: str = "") -> str:
     if sku_blocks:
         sku_section = "**SKU lookup** (from your message)\n\n" + "\n\n".join(sku_blocks) + "\n\n---\n\n"
     list_section = f"**In-stock snapshot**\n\n```text\n{inv_preview}\n```"
-    return intro + "\n\n" + sku_section + list_section
+    return intro + "\n\n" + sku_section + search_block + list_section
 
 
 def _sidebar_signed_in(customer):
