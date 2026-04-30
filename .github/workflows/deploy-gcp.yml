@@ -14,12 +14,16 @@
 #                                 If set, deploy passes --set-secrets=OPENAI_API_KEY=SECRET_NAME:latest
 #
 # One-time GCP setup: see DEPLOY_GCP.md
+#
+# Automatic deploy: every push to the default branch `main` runs tests, then builds and deploys
+# to Cloud Run (after repository variables are configured). Manual runs: workflow_dispatch.
 
 name: Deploy to GCP (Cloud Run)
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
   workflow_dispatch:
 
 concurrency:
@@ -58,7 +62,10 @@ jobs:
     name: Build and deploy
     needs: test
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    # Auto: push to main only. Manual: workflow_dispatch from any branch (operator choice).
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
     steps:
       - name: Checkout
         uses: actions/checkout@v4

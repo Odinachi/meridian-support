@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import logging
 import os
-import time
 
 import streamlit as st
 
+from meridian.agent_streaming import iter_static_text_chunks
 from meridian.auth_agent import MeridianAuthContext, run_auth_agent_turn
 from meridian.auth_audit import email_domain_only
 from meridian.logout_intent import looks_like_logout_request, parse_logout_confirmation
@@ -16,7 +16,7 @@ from meridian.principal import (
     principal_from_session_dict,
     principal_to_session_dict,
 )
-from meridian.support_agent import run_support_agent_turn
+from meridian.support_agent import stream_support_agent_turn
 
 try:
     from dotenv import load_dotenv
@@ -54,12 +54,6 @@ def _perform_sign_out():
         st.session_state[SESSION_LOGOUT_PENDING] = False
         st.session_state.messages = []
         _reset_auth_state()
-
-
-def stream_text(text: str, chunk_chars: int = 8):
-    for i in range(0, len(text), chunk_chars):
-        yield text[i : i + chunk_chars]
-        time.sleep(0.02)
 
 
 def _ensure_chat_state():
@@ -131,7 +125,7 @@ def _render_auth_chat():
 
             st.session_state[SESSION_AUTH_MESSAGES].append({"role": "assistant", "content": reply})
             with st.chat_message("assistant"):
-                st.markdown(reply)
+                st.write_stream(iter_static_text_chunks(reply))
 
             principal = ctx.pending_principal
             if principal is not None:
@@ -206,42 +200,45 @@ def main():
                         reply = "You're signed out. When you're ready, sign in again from here."
                         st.session_state.messages.append({"role": "assistant", "content": reply})
                         with st.chat_message("assistant"):
-                            st.write_stream(stream_text(reply))
+                            st.write_stream(iter_static_text_chunks(reply))
                         _perform_sign_out()
                         st.rerun()
                     elif decision == "no":
                         st.session_state[SESSION_LOGOUT_PENDING] = False
                         reply = "Understood—you're still signed in. What else do you need?"
                         with st.chat_message("assistant"):
-                            st.write_stream(stream_text(reply))
+                            st.write_stream(iter_static_text_chunks(reply))
                         st.session_state.messages.append({"role": "assistant", "content": reply})
                     else:
                         reply = "Sign out—yes or no?"
                         with st.chat_message("assistant"):
-                            st.write_stream(stream_text(reply))
+                            st.write_stream(iter_static_text_chunks(reply))
                         st.session_state.messages.append({"role": "assistant", "content": reply})
                 elif looks_like_logout_request(prompt):
                     st.session_state[SESSION_LOGOUT_PENDING] = True
                     reply = "End this session? Reply yes to sign out, or no to stay."
                     with st.chat_message("assistant"):
-                        st.write_stream(stream_text(reply))
+                        st.write_stream(iter_static_text_chunks(reply))
                     st.session_state.messages.append({"role": "assistant", "content": reply})
                 else:
-                    try:
-                        turn = run_support_agent_turn(
-                            st.session_state.messages,
-                            acting_customer_id=customer.customer_id,
-                        )
-                        reply = turn.reply_markdown
-                    except RuntimeError as exc:
-                        reply = f"Setup issue: {exc}"
-                    except Exception as exc:  # noqa: BLE001
-                        reply = (
-                            f"Support agent hit an error ({type(exc).__name__}). "
-                            "Check `OPENAI_API_KEY` and MCP connectivity, then try again."
-                        )
                     with st.chat_message("assistant"):
-                        st.write_stream(stream_text(reply))
+                        try:
+                            chunks, finalize_support = stream_support_agent_turn(
+                                st.session_state.messages,
+                                acting_customer_id=customer.customer_id,
+                            )
+                            st.write_stream(chunks)
+                            turn = finalize_support()
+                            reply = turn.reply_markdown
+                        except RuntimeError as exc:
+                            reply = f"Setup issue: {exc}"
+                            st.write_stream(iter_static_text_chunks(reply))
+                        except Exception as exc:  # noqa: BLE001
+                            reply = (
+                                f"Support agent hit an error ({type(exc).__name__}). "
+                                "Check `OPENAI_API_KEY` and MCP connectivity, then try again."
+                            )
+                            st.write_stream(iter_static_text_chunks(reply))
                     st.session_state.messages.append({"role": "assistant", "content": reply})
         return
 

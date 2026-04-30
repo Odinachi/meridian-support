@@ -57,6 +57,12 @@ gcloud iam service-accounts create github-deploy \
   --display-name="GitHub Actions deploy Meridian"
 ```
 
+If you see **`Service account github-deploy already exists`**, skip creation—the account is already there. Confirm and continue with IAM grants below:
+
+```bash
+gcloud iam service-accounts describe "${DEPLOY_SA}" --project="${PROJECT_ID}"
+```
+
 Grant it:
 
 - **Artifact Registry** — push images to your repo (e.g. `roles/artifactregistry.writer` scoped to the repository, or writer on the repo resource).
@@ -79,17 +85,75 @@ Adjust if you use a **custom runtime** service account for Cloud Run (`--service
 
 ## 4. Workload Identity Federation (OIDC → GCP)
 
-Follow Google’s guide: [Workload Identity Federation with a GitHub repository](https://github.com/google-github-actions/auth#setting-up-workload-identity-federation).
+Full guide: [google-github-actions/auth — Workload Identity Federation](https://github.com/google-github-actions/auth#setting-up-workload-identity-federation).
 
-Summary:
+### What `GCP_WORKLOAD_IDENTITY_PROVIDER` is
 
-1. Create a **Workload Identity Pool** and **OIDC provider** for `token.actions.githubusercontent.com` with attribute mapping (e.g. `attribute.repository` / `attribute.ref`).
-2. **Allow only your repo** (and optionally only `ref:refs/heads/main`) to impersonate `github-deploy@...`.
-3. Copy the provider resource name into GitHub variable **`GCP_WORKLOAD_IDENTITY_PROVIDER`**, e.g.:
+It is the **full resource name** of the **OIDC provider** inside a **Workload Identity Pool** (not the pool id alone). Shape:
 
-   `projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/github-pool/providers/github-provider`
+```text
+projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/POOL_ID/providers/PROVIDER_ID
+```
 
-4. Set **`GCP_SERVICE_ACCOUNT_EMAIL`** to `github-deploy@PROJECT_ID.iam.gserviceaccount.com`.
+Use **`PROJECT_NUMBER`** (digits), not the project id string. Example:
+
+```text
+projects/123456789012/locations/global/workloadIdentityPools/github-pool/providers/github-provider
+```
+
+### Create pool + provider (`gcloud`)
+
+Replace `PROJECT_ID`, `POOL_ID`, `PROVIDER_ID`, and GitHub `REPO` (`ORG_OR_USER/REPO_NAME`) as needed.
+
+```bash
+export PROJECT_ID="your-project-id"
+export PROJECT_NUMBER="$(gcloud projects describe "${PROJECT_ID}" --format='value(projectNumber)')"
+export POOL_ID="github-pool"
+export PROVIDER_ID="github-provider"
+export GITHUB_REPO="YOUR_GITHUB_ORG/meridian"   # e.g. acme-corp/meridian
+
+gcloud iam workload-identity-pools create "${POOL_ID}" \
+  --project="${PROJECT_ID}" \
+  --location="global" \
+  --display-name="GitHub Actions"
+
+gcloud iam workload-identity-pools providers create-oidc "${PROVIDER_ID}" \
+  --project="${PROJECT_ID}" \
+  --location="global" \
+  --workload-identity-pool="${POOL_ID}" \
+  --display-name="GitHub OIDC" \
+  --issuer-uri="https://token.actions.githubusercontent.com" \
+  --attribute-mapping="google.subject=assertion.sub,attribute.repository=assertion.repository,attribute.ref=assertion.ref"
+
+# Let GitHub Actions from this repo impersonate the deployer service account
+gcloud iam service-accounts add-iam-policy-binding "github-deploy@${PROJECT_ID}.iam.gserviceaccount.com" \
+  --project="${PROJECT_ID}" \
+  --role="roles/iam.workloadIdentityUser" \
+  --member="principalSet://iam.googleapis.com/projects/${PROJECT_NUMBER}/locations/global/workloadIdentityPools/${POOL_ID}/attribute.repository/${GITHUB_REPO}"
+```
+
+### Get the value for GitHub variable `GCP_WORKLOAD_IDENTITY_PROVIDER`
+
+After the provider exists, print the string (same pattern Google shows in the console):
+
+```bash
+echo "projects/${PROJECT_NUMBER}/locations/global/workloadIdentityPools/${POOL_ID}/providers/${PROVIDER_ID}"
+```
+
+Copy that **one line** into **GitHub → Settings → Secrets and variables → Actions → Variables → `GCP_WORKLOAD_IDENTITY_PROVIDER`**.
+
+### Console alternative
+
+1. **IAM & Admin** → **Workload Identity Federation** → open your **pool** → **Providers** → click the GitHub OIDC **provider**.  
+2. Copy **Provider name** (full `projects/…/providers/…` path).
+
+### Optional: restrict to branch `main` only
+
+Tighten the `principalSet` / use a **condition** on the `workloadIdentityUser` binding so only `ref:refs/heads/main` can authenticate (see Google’s “attribute condition” examples in the link above).
+
+### Also set
+
+**`GCP_SERVICE_ACCOUNT_EMAIL`** = `github-deploy@PROJECT_ID.iam.gserviceaccount.com` (the SA that receives `workloadIdentityUser`).
 
 No JSON key is stored in GitHub.
 
@@ -172,10 +236,13 @@ Open the printed **Service URL** and verify sign-in and support chat.
 
 ## 8. CI behavior
 
+- **Trigger:** On every **push to `main`**, GitHub Actions runs this workflow. The **test** job always runs on that push; the **deploy** job runs only when `github.ref` is **`refs/heads/main`** (so pushes to other branches do not deploy, unless you add them under `on.push.branches` and extend the deploy `if`).
 - **Test** job: Python 3.12, `pip install -r requirements.txt`, `pytest tests/ -q`.
 - **Deploy** job: fails fast if required variables are missing; authenticates via WIF; builds/pushes `:GITHUB_SHA` and `:latest`; deploys Cloud Run with **concurrency 1** (required for Streamlit per instance), **session affinity**, **2Gi** memory, **900s** request timeout (agent + MCP calls).
 
-To deploy from a branch other than `main`, change the workflow `on.push.branches` or use **Run workflow** (`workflow_dispatch`) after merging to `main` (current trigger is `main` only).
+**Manual deploy:** In GitHub → **Actions** → **Deploy to GCP (Cloud Run)** → **Run workflow** (`workflow_dispatch`). That can deploy from the branch you select (useful for hotfix branches); ensure that branch’s image is what you intend to ship.
+
+If your default branch is not `main`, either rename it to `main` in the repository settings or edit `.github/workflows/deploy-gcp.yml` (`on.push.branches` and the deploy job `if` condition) to match your branch name.
 
 ---
 
@@ -183,6 +250,7 @@ To deploy from a branch other than `main`, change the workflow `on.push.branches
 
 | Symptom | Check |
 |---------|--------|
+| `Service account github-deploy already exists` | Normal if you ran create before—use `gcloud iam service-accounts describe github-deploy@PROJECT_ID.iam.gserviceaccount.com` and continue with IAM + WIF (§3–§5) |
 | `Permission denied` on push | Deploy SA has Artifact Registry write on the repo |
 | `Permission denied` on deploy | Deploy SA has `run.admin` (or equivalent) and `iam.serviceAccountUser` on runtime SA |
 | `Could not resolve secrets` | Secret exists; runtime SA has `secretAccessor`; `GCP_OPENAI_SECRET_NAME` matches secret **id** |

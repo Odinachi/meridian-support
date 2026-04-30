@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import time
+from collections.abc import Callable, Iterator
 from typing import Any
 
 from agents.agent import Agent
@@ -13,6 +14,7 @@ from agents.run import Runner
 from agents.run_context import RunContextWrapper
 from agents.tool import function_tool
 
+from meridian.agent_streaming import stream_agent_text_chunks
 from meridian.auth_agent import require_openai_key
 from meridian.mcp_guard import MCPAuthRequired
 from meridian.models import SupportAgentContext, SupportAgentResponse
@@ -305,6 +307,21 @@ def _support_tools() -> list[Any]:
     return base
 
 
+def _parse_support_agent_output(result: Any) -> tuple[SupportAgentResponse, bool]:
+    parsed = result.final_output_as(SupportAgentResponse, raise_if_incorrect_type=False)
+    if parsed is not None:
+        return parsed, True
+    out = result.final_output
+    text = out if isinstance(out, str) else str(out)
+    return (
+        SupportAgentResponse(
+            reply_markdown=(text or "").strip() or "(empty)",
+            tools_were_used=False,
+        ),
+        False,
+    )
+
+
 def build_support_agent() -> Agent[SupportAgentContext]:
     model = os.environ.get("OPENAI_MERIDIAN_SUPPORT_MODEL", "gpt-4o-mini")
     return Agent[SupportAgentContext](
@@ -351,16 +368,7 @@ def run_support_agent_turn(
         context=context,
         max_turns=32,
     )
-    parsed = result.final_output_as(SupportAgentResponse, raise_if_incorrect_type=False)
-    if parsed is not None:
-        structured = parsed
-    else:
-        out = result.final_output
-        text = out if isinstance(out, str) else str(out)
-        structured = SupportAgentResponse(
-            reply_markdown=(text or "").strip() or "(empty)",
-            tools_were_used=False,
-        )
+    structured, structured_ok = _parse_support_agent_output(result)
     log_tool_event(
         _LOG,
         logging.INFO,
@@ -374,7 +382,69 @@ def run_support_agent_turn(
             "trace": trace,
             "reply_chars": len(structured.reply_markdown),
             "tools_were_used": structured.tools_were_used,
-            "structured_parse_ok": parsed is not None,
+            "structured_parse_ok": structured_ok,
         },
     )
     return structured
+
+
+def stream_support_agent_turn(
+    conversation: list[dict[str, Any]],
+    *,
+    acting_customer_id: str,
+) -> tuple[Iterator[str], Callable[[], SupportAgentResponse]]:
+    """
+    Same as :func:`run_support_agent_turn`, but yield model text deltas as they arrive (for
+    ``st.write_stream``). Call the returned ``finalize()`` after the iterator is exhausted to
+    obtain the parsed :class:`~meridian.models.SupportAgentResponse` and emit completion logs.
+    """
+    t0 = time.perf_counter()
+    trace = get_trace_id()
+    log_tool_event(
+        _LOG,
+        logging.INFO,
+        "support.agent.turn.start",
+        tool="MeridianSupport",
+        customer_id_suffix=acting_customer_id[-8:]
+        if len(acting_customer_id) >= 8
+        else acting_customer_id,
+        extra_fields={
+            "trace": trace,
+            "message_count": len(conversation),
+            "create_order_tool": _order_submit_enabled(),
+            "streaming": True,
+        },
+    )
+    require_openai_key()
+    context = SupportAgentContext(acting_customer_id=acting_customer_id)
+    agent = build_support_agent()
+    chunks, get_streamed = stream_agent_text_chunks(
+        agent=agent,
+        conversation=conversation,
+        context=context,
+        max_turns=32,
+    )
+
+    def finalize() -> SupportAgentResponse:
+        streamed = get_streamed()
+        structured, structured_ok = _parse_support_agent_output(streamed)
+        log_tool_event(
+            _LOG,
+            logging.INFO,
+            "support.agent.turn.done",
+            tool="MeridianSupport",
+            duration_ms=(time.perf_counter() - t0) * 1000,
+            customer_id_suffix=acting_customer_id[-8:]
+            if len(acting_customer_id) >= 8
+            else acting_customer_id,
+            extra_fields={
+                "trace": trace,
+                "reply_chars": len(structured.reply_markdown),
+                "tools_were_used": structured.tools_were_used,
+                "structured_parse_ok": structured_ok,
+                "streaming": True,
+            },
+        )
+        return structured
+
+    return chunks, finalize

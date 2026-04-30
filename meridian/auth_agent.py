@@ -108,6 +108,15 @@ def build_auth_agent() -> Agent[MeridianAuthContext]:
     )
 
 
+def _parse_auth_agent_output(result: Any) -> tuple[str, bool]:
+    parsed = result.final_output_as(AuthAgentResponse, raise_if_incorrect_type=False)
+    if parsed is not None:
+        return parsed.reply_markdown, True
+    out = result.final_output
+    text = out if isinstance(out, str) else str(out)
+    return (text or "").strip() or "(empty)", False
+
+
 def require_openai_key() -> str:
     key = (os.environ.get("OPENAI_API_KEY") or "").strip()
     if not key:
@@ -148,13 +157,7 @@ def run_auth_agent_turn(
         context=context,
         max_turns=16,
     )
-    parsed = result.final_output_as(AuthAgentResponse, raise_if_incorrect_type=False)
-    if parsed is not None:
-        text = parsed.reply_markdown
-    else:
-        out = result.final_output
-        text = out if isinstance(out, str) else str(out)
-        text = (text or "").strip() or "(empty)"
+    text, structured_ok = _parse_auth_agent_output(result)
     log_tool_event(
         _LOG,
         logging.INFO,
@@ -165,7 +168,7 @@ def run_auth_agent_turn(
             "trace": trace,
             "reply_chars": len(text),
             "pending_verified": context.pending_principal is not None,
-            "structured_parse_ok": parsed is not None,
+            "structured_parse_ok": structured_ok,
         },
     )
     return text
