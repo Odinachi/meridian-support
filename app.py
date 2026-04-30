@@ -10,6 +10,7 @@ import streamlit as st
 from meridian.auth_agent import MeridianAuthContext, run_auth_agent_turn
 from meridian.mcp_client import tool_result_text
 from meridian.mcp_guard import MCPAuthRequired, call_tool_sync_guarded
+from meridian.logout_intent import looks_like_logout_request, parse_logout_confirmation
 from meridian.principal import (
     principal_from_session_dict,
     principal_to_session_dict,
@@ -28,6 +29,14 @@ load_dotenv()
 SESSION_CUSTOMER = "meridian_authenticated_customer"
 SESSION_AUTH_MESSAGES = "meridian_auth_chat_messages"
 SESSION_AUTH_CONTEXT = "meridian_auth_context"
+SESSION_LOGOUT_PENDING = "meridian_logout_confirm_pending"
+
+
+def _perform_sign_out():
+    st.session_state[SESSION_CUSTOMER] = None
+    st.session_state[SESSION_LOGOUT_PENDING] = False
+    st.session_state.messages = []
+    _reset_auth_state()
 
 
 def stream_text(text: str, chunk_chars: int = 8):
@@ -39,6 +48,8 @@ def stream_text(text: str, chunk_chars: int = 8):
 def _ensure_chat_state():
     if "messages" not in st.session_state:
         st.session_state.messages = []
+    if SESSION_LOGOUT_PENDING not in st.session_state:
+        st.session_state[SESSION_LOGOUT_PENDING] = False
 
 
 def _ensure_auth_state():
@@ -53,7 +64,7 @@ def _reset_auth_state():
     st.session_state[SESSION_AUTH_CONTEXT] = MeridianAuthContext()
 
 
-def mock_reply(user_text: str, customer_id: str, label: str) -> str:
+def mock_reply(user_text: str, customer_id: str) -> str:
     """Demo support reply; MCP calls go only through the guarded client."""
     try:
         inv = tool_result_text(
@@ -70,7 +81,6 @@ def mock_reply(user_text: str, customer_id: str, label: str) -> str:
         inv_preview = f"Inventory call failed ({type(exc).__name__}): {exc}"
 
     return (
-        f"_Signed in as {label}._\n\n"
         f"**Your message:** {user_text[:280]}{'…' if len(user_text) > 280 else ''}\n\n"
         "**Active products (first chunk via MCP, gated by session):**\n\n"
         f"```text\n{inv_preview}\n```"
@@ -84,9 +94,7 @@ def _sidebar_signed_in(customer):
     with st.sidebar.expander("Profile from MCP"):
         st.markdown(customer.details_text or "_No detail text stored._")
     if st.sidebar.button("Sign out", type="secondary"):
-        st.session_state[SESSION_CUSTOMER] = None
-        st.session_state.messages = []
-        _reset_auth_state()
+        _perform_sign_out()
         st.rerun()
 
 
@@ -175,16 +183,48 @@ def main():
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
 
-        label = f"{customer.display_name} <{customer.email}>"
         if prompt := st.chat_input("Ask about products, orders, or shipping…"):
             st.session_state.messages.append({"role": "user", "content": prompt})
             with st.chat_message("user"):
                 st.markdown(prompt)
 
-            reply = mock_reply(prompt, customer.customer_id, label)
-            with st.chat_message("assistant"):
-                st.write_stream(stream_text(reply))
-            st.session_state.messages.append({"role": "assistant", "content": reply})
+            if st.session_state[SESSION_LOGOUT_PENDING]:
+                decision = parse_logout_confirmation(prompt)
+                if decision == "yes":
+                    reply = "Signing you out now. You can sign in again anytime from this page."
+                    st.session_state.messages.append({"role": "assistant", "content": reply})
+                    with st.chat_message("assistant"):
+                        st.write_stream(stream_text(reply))
+                    _perform_sign_out()
+                    st.rerun()
+                elif decision == "no":
+                    st.session_state[SESSION_LOGOUT_PENDING] = False
+                    reply = "Okay — you’re still signed in. How else can I help?"
+                    with st.chat_message("assistant"):
+                        st.write_stream(stream_text(reply))
+                    st.session_state.messages.append({"role": "assistant", "content": reply})
+                else:
+                    reply = (
+                        "I didn’t catch that. Do you want to **sign out**? "
+                        "Reply **yes** to log out or **no** to stay signed in."
+                    )
+                    with st.chat_message("assistant"):
+                        st.write_stream(stream_text(reply))
+                    st.session_state.messages.append({"role": "assistant", "content": reply})
+            elif looks_like_logout_request(prompt):
+                st.session_state[SESSION_LOGOUT_PENDING] = True
+                reply = (
+                    "Do you want to **sign out** of Meridian support? "
+                    "Reply **yes** to confirm or **no** to stay signed in."
+                )
+                with st.chat_message("assistant"):
+                    st.write_stream(stream_text(reply))
+                st.session_state.messages.append({"role": "assistant", "content": reply})
+            else:
+                reply = mock_reply(prompt, customer.customer_id)
+                with st.chat_message("assistant"):
+                    st.write_stream(stream_text(reply))
+                st.session_state.messages.append({"role": "assistant", "content": reply})
         return
 
     _sidebar_auth_gate()
