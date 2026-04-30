@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 
 import streamlit as st
@@ -77,13 +78,49 @@ def _reset_auth_state():
     st.session_state[SESSION_AUTH_CONTEXT] = MeridianAuthContext()
 
 
-def mock_reply(customer_id: str) -> str:
-    """Demo support reply; catalog via guarded ``list_products`` wrapper."""
+_SKU_IN_MESSAGE = re.compile(r"\b([A-Za-z]{3}-\d{4})\b")
+
+
+def _skus_from_user_message(text: str, *, limit: int = 3) -> list[str]:
+    """First few unique SKUs mentioned (e.g. COM-0001), order preserved, max ``limit``."""
+    out: list[str] = []
+    for m in _SKU_IN_MESSAGE.finditer(text or ""):
+        sku = m.group(1).upper()
+        if sku not in out:
+            out.append(sku)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def mock_reply(customer_id: str, user_message: str = "") -> str:
+    """Demo support reply: optional ``get_product`` by SKU from the message, plus ``list_products``."""
+    from meridian.tools.get_product import (
+        GetProductMCPError,
+        GetProductNotFoundError,
+        GetProductValidationError,
+        fetch_get_product,
+    )
     from meridian.tools.list_products import (
         ListProductsMCPError,
         ListProductsValidationError,
         fetch_list_products,
     )
+
+    sku_blocks: list[str] = []
+    for sku in _skus_from_user_message(user_message):
+        try:
+            detail = fetch_get_product(acting_customer_id=customer_id, sku=sku)
+            clip = detail[:4000] + ("…" if len(detail) > 4000 else "")
+            sku_blocks.append(f"**{sku}**\n```text\n{clip}\n```")
+        except GetProductValidationError as exc:
+            sku_blocks.append(f"**{sku}** — {exc}")
+        except GetProductNotFoundError as exc:
+            sku_blocks.append(f"**{sku}** — {exc}")
+        except GetProductMCPError as exc:
+            sku_blocks.append(f"**{sku}** — {exc}")
+        except MCPAuthRequired as exc:
+            sku_blocks.append(f"**{sku}** — {exc}")
 
     try:
         inv = fetch_list_products(
@@ -101,11 +138,15 @@ def mock_reply(customer_id: str) -> str:
     except Exception as exc:  # noqa: BLE001
         inv_preview = f"Couldn't load inventory ({type(exc).__name__})."
 
-    return (
+    intro = (
         "We're not answering end-to-end yet—this build still routes through a demo path. "
-        "Here's a current slice of **in-stock catalog** so you can see live data behind the session:\n\n"
-        f"```text\n{inv_preview}\n```"
+        "Below is live catalog data for your signed-in session."
     )
+    sku_section = ""
+    if sku_blocks:
+        sku_section = "**SKU lookup** (from your message)\n\n" + "\n\n".join(sku_blocks) + "\n\n---\n\n"
+    list_section = f"**In-stock snapshot**\n\n```text\n{inv_preview}\n```"
+    return intro + "\n\n" + sku_section + list_section
 
 
 def _sidebar_signed_in(customer):
@@ -248,7 +289,7 @@ def main():
                         st.write_stream(stream_text(reply))
                     st.session_state.messages.append({"role": "assistant", "content": reply})
                 else:
-                    reply = mock_reply(customer.customer_id)
+                    reply = mock_reply(customer.customer_id, prompt)
                     with st.chat_message("assistant"):
                         st.write_stream(stream_text(reply))
                     st.session_state.messages.append({"role": "assistant", "content": reply})
