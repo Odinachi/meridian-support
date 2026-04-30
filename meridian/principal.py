@@ -1,31 +1,16 @@
-"""Authenticated customer record (no secrets)."""
+"""Authenticated customer record (no secrets) — session helpers."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from meridian.models import CustomerPrincipal
 
 
-@dataclass(frozen=True)
-class CustomerPrincipal:
-    customer_id: str
-    email: str
-    display_name: str
-    details_text: str
-
-
-def principal_to_session_dict(p: CustomerPrincipal) -> dict:
-    return {
-        "customer_id": p.customer_id,
-        "email": p.email,
-        "display_name": p.display_name,
-        "details_text": p.details_text,
-    }
+def principal_to_session_dict(p: CustomerPrincipal) -> dict[str, str]:
+    return p.model_dump()
 
 
 def principal_from_session_dict(data: dict) -> CustomerPrincipal:
-    return CustomerPrincipal(
-        customer_id=data["customer_id"],
-        email=data["email"],
-        display_name=data["display_name"],
-        details_text=data.get("details_text", ""),
-    )
+    return CustomerPrincipal.model_validate(data)
+
+
+__all__ = ["CustomerPrincipal", "principal_from_session_dict", "principal_to_session_dict"]

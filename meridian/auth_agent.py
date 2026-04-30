@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 import os
 import time
-from dataclasses import dataclass, field
 from typing import Any
 
 from agents.agent import Agent
@@ -16,17 +15,9 @@ from agents.tool import function_tool
 from meridian.auth import AuthError, verify_customer_pin
 from meridian.auth_audit import email_domain_only
 from meridian.observability import get_trace_id, log_tool_event
-from meridian.principal import CustomerPrincipal
+from meridian.models import CustomerPrincipal, MeridianAuthContext
 
 _LOG = logging.getLogger("meridian.auth_agent")
-
-
-@dataclass
-class MeridianAuthContext:
-    """Mutable run context shared with tools (one instance per Streamlit session)."""
-
-    pending_principal: CustomerPrincipal | None = None
-    last_tool_user_visible: str | None = field(default=None, repr=False)
 
 
 AUTH_AGENT_INSTRUCTIONS = """You work for Meridian Electronics and only handle account verification before support.

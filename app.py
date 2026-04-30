@@ -93,6 +93,38 @@ def _skus_from_user_message(text: str, *, limit: int = 3) -> list[str]:
     return out
 
 
+_ORDER_STATUS_IN_MESSAGE = re.compile(
+    r"\b(draft|submitted|approved|fulfilled|cancelled)\b",
+    re.IGNORECASE,
+)
+
+
+def _order_status_from_message(text: str) -> str | None:
+    m = _ORDER_STATUS_IN_MESSAGE.search(text or "")
+    return m.group(1).lower() if m else None
+
+
+_UUID_IN_MESSAGE = re.compile(
+    r"\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b",
+    re.IGNORECASE,
+)
+
+
+def _order_ids_for_lookup(text: str, session_customer_id: str, *, limit: int = 3) -> list[str]:
+    """UUIDs in the message that are not the session customer id (those are usually order ids)."""
+    sn = session_customer_id.strip().lower()
+    out: list[str] = []
+    for m in _UUID_IN_MESSAGE.finditer(text or ""):
+        uid = m.group(1).lower()
+        if uid == sn:
+            continue
+        if uid not in out:
+            out.append(uid)
+        if len(out) >= limit:
+            break
+    return out
+
+
 def _search_query_candidate(text: str) -> str | None:
     """
     Derive a catalog search string from the user message.
@@ -110,7 +142,16 @@ def _search_query_candidate(text: str) -> str | None:
 
 
 def mock_reply(customer_id: str, user_message: str = "") -> str:
-    """Demo reply: profile, SKUs, search, and catalog snapshot (all guarded MCP)."""
+    """Demo reply: profile, orders, order UUID detail, optional ``ORDER_SUBMIT:`` (env), SKUs, search, catalog."""
+    from meridian.tools.create_order import (
+        CreateOrderCustomerNotFoundError,
+        CreateOrderInsufficientInventoryError,
+        CreateOrderMCPError,
+        CreateOrderProductNotFoundError,
+        CreateOrderValidationError,
+        fetch_create_order,
+        parse_order_submit_payload,
+    )
     from meridian.tools.get_customer import (
         GetCustomerAccessError,
         GetCustomerMCPError,
@@ -118,11 +159,23 @@ def mock_reply(customer_id: str, user_message: str = "") -> str:
         GetCustomerValidationError,
         fetch_get_customer,
     )
+    from meridian.tools.get_order import (
+        GetOrderAccessError,
+        GetOrderMCPError,
+        GetOrderNotFoundError,
+        GetOrderValidationError,
+        fetch_get_order,
+    )
     from meridian.tools.get_product import (
         GetProductMCPError,
         GetProductNotFoundError,
         GetProductValidationError,
         fetch_get_product,
+    )
+    from meridian.tools.list_orders import (
+        ListOrdersMCPError,
+        ListOrdersValidationError,
+        fetch_list_orders,
     )
     from meridian.tools.list_products import (
         ListProductsMCPError,
@@ -142,8 +195,7 @@ def mock_reply(customer_id: str, user_message: str = "") -> str:
         profile_block = f"**Your profile**\n\n```text\n{pclip}\n```\n\n---\n\n"
     except GetCustomerValidationError as exc:
         profile_block = f"**Your profile** — {exc}\n\n---\n\n"
-    except GetCustomerAccessError as exc:
-        profile_block = f"**Your profile** — {exc}\n\n---\n\n"
+   
     except GetCustomerNotFoundError as exc:
         profile_block = f"**Your profile** — {exc}\n\n---\n\n"
     except GetCustomerMCPError as exc:
@@ -152,6 +204,92 @@ def mock_reply(customer_id: str, user_message: str = "") -> str:
         profile_block = f"**Your profile** — {exc}\n\n---\n\n"
     except Exception as exc:  # noqa: BLE001
         profile_block = f"**Your profile** — {type(exc).__name__}\n\n---\n\n"
+
+    orders_block = ""
+    order_status = _order_status_from_message(user_message)
+    try:
+        orders = fetch_list_orders(
+            acting_customer_id=customer_id,
+            customer_id=None,
+            status=order_status,
+        )
+        oclip = orders[:4500] + ("…" if len(orders) > 4500 else "")
+        status_note = f" (status: **{order_status}**)" if order_status else ""
+        orders_block = f"**Your orders**{status_note}\n\n```text\n{oclip}\n```\n\n---\n\n"
+    except ListOrdersValidationError as exc:
+        orders_block = f"**Your orders** — {exc}\n\n---\n\n"
+    except GetCustomerAccessError as exc:
+        orders_block = f"**Your orders** — {exc}\n\n---\n\n"
+    except GetCustomerValidationError as exc:
+        orders_block = f"**Your orders** — {exc}\n\n---\n\n"
+    except ListOrdersMCPError as exc:
+        orders_block = f"**Your orders** — {exc}\n\n---\n\n"
+    except MCPAuthRequired as exc:
+        orders_block = f"**Your orders** — {exc}\n\n---\n\n"
+    except Exception as exc:  # noqa: BLE001
+        orders_block = f"**Your orders** — {type(exc).__name__}\n\n---\n\n"
+
+    order_detail_blocks: list[str] = []
+    for oid in _order_ids_for_lookup(user_message, customer_id):
+        try:
+            odetail = fetch_get_order(acting_customer_id=customer_id, order_id=oid)
+            oclip = odetail[:5000] + ("…" if len(odetail) > 5000 else "")
+            order_detail_blocks.append(f"**Order `{oid}`**\n\n```text\n{oclip}\n```")
+        except GetOrderValidationError as exc:
+            order_detail_blocks.append(f"**Order `{oid}`** — {exc}")
+        except GetOrderNotFoundError as exc:
+            order_detail_blocks.append(f"**Order `{oid}`** — {exc}")
+        except GetOrderAccessError as exc:
+            order_detail_blocks.append(f"**Order `{oid}`** — {exc}")
+        except GetOrderMCPError as exc:
+            order_detail_blocks.append(f"**Order `{oid}`** — {exc}")
+        except MCPAuthRequired as exc:
+            order_detail_blocks.append(f"**Order `{oid}`** — {exc}")
+        except Exception as exc:  # noqa: BLE001
+            order_detail_blocks.append(f"**Order `{oid}`** — {type(exc).__name__}")
+
+    order_detail_section = ""
+    if order_detail_blocks:
+        order_detail_section = (
+            "**Order detail** (UUIDs in your message)\n\n"
+            + "\n\n".join(order_detail_blocks)
+            + "\n\n---\n\n"
+        )
+
+    submit_block = ""
+    if (os.environ.get("MERIDIAN_ENABLE_ORDER_SUBMIT") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        raw_submit = parse_order_submit_payload(user_message)
+        if raw_submit:
+            try:
+                confirmation = fetch_create_order(
+                    acting_customer_id=customer_id,
+                    items=raw_submit,
+                )
+                cclip = confirmation[:6000] + ("…" if len(confirmation) > 6000 else "")
+                submit_block = (
+                    "**Order placed** (`ORDER_SUBMIT:` line — real MCP write)\n\n"
+                    f"```text\n{cclip}\n```\n\n---\n\n"
+                )
+            except CreateOrderValidationError as exc:
+                submit_block = f"**Order submit** — {exc}\n\n---\n\n"
+            except CreateOrderInsufficientInventoryError as exc:
+                submit_block = f"**Order submit** — {exc}\n\n---\n\n"
+            except CreateOrderProductNotFoundError as exc:
+                submit_block = f"**Order submit** — {exc}\n\n---\n\n"
+            except CreateOrderCustomerNotFoundError as exc:
+                submit_block = f"**Order submit** — {exc}\n\n---\n\n"
+            except CreateOrderMCPError as exc:
+                submit_block = f"**Order submit** — {exc}\n\n---\n\n"
+            except GetCustomerAccessError as exc:
+                submit_block = f"**Order submit** — {exc}\n\n---\n\n"
+            except MCPAuthRequired as exc:
+                submit_block = f"**Order submit** — {exc}\n\n---\n\n"
+            except Exception as exc:  # noqa: BLE001
+                submit_block = f"**Order submit** — {type(exc).__name__}\n\n---\n\n"
 
     sku_blocks: list[str] = []
     for sku in _skus_from_user_message(user_message):
@@ -205,13 +343,23 @@ def mock_reply(customer_id: str, user_message: str = "") -> str:
 
     intro = (
         "We're not answering end-to-end yet—this build still routes through a demo path. "
-        "Below is live data for your signed-in session (profile + catalog)."
+        "Below is live data for your signed-in session (profile, orders, catalog)."
     )
     sku_section = ""
     if sku_blocks:
         sku_section = "**SKU lookup** (from your message)\n\n" + "\n\n".join(sku_blocks) + "\n\n---\n\n"
     list_section = f"**In-stock snapshot**\n\n```text\n{inv_preview}\n```"
-    return intro + "\n\n" + profile_block + sku_section + search_block + list_section
+    return (
+        intro
+        + "\n\n"
+        + profile_block
+        + orders_block
+        + order_detail_section
+        + submit_block
+        + sku_section
+        + search_block
+        + list_section
+    )
 
 
 def _sidebar_signed_in(customer):
