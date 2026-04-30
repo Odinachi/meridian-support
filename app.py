@@ -4,20 +4,19 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 import time
 
 import streamlit as st
 
 from meridian.auth_agent import MeridianAuthContext, run_auth_agent_turn
 from meridian.auth_audit import email_domain_only
-from meridian.mcp_guard import MCPAuthRequired
 from meridian.logout_intent import looks_like_logout_request, parse_logout_confirmation
 from meridian.observability import configure_logging, log_tool_event, new_trace_id, trace_scope
 from meridian.principal import (
     principal_from_session_dict,
     principal_to_session_dict,
 )
+from meridian.support_agent import run_support_agent_turn
 
 try:
     from dotenv import load_dotenv
@@ -35,6 +34,10 @@ SESSION_CUSTOMER = "meridian_authenticated_customer"
 SESSION_AUTH_MESSAGES = "meridian_auth_chat_messages"
 SESSION_AUTH_CONTEXT = "meridian_auth_context"
 SESSION_LOGOUT_PENDING = "meridian_logout_confirm_pending"
+
+
+def _openai_configured() -> bool:
+    return bool((os.environ.get("OPENAI_API_KEY") or "").strip())
 
 
 def _perform_sign_out():
@@ -78,290 +81,6 @@ def _reset_auth_state():
     st.session_state[SESSION_AUTH_CONTEXT] = MeridianAuthContext()
 
 
-_SKU_IN_MESSAGE = re.compile(r"\b([A-Za-z]{3}-\d{4})\b")
-
-
-def _skus_from_user_message(text: str, *, limit: int = 3) -> list[str]:
-    """First few unique SKUs mentioned (e.g. COM-0001), order preserved, max ``limit``."""
-    out: list[str] = []
-    for m in _SKU_IN_MESSAGE.finditer(text or ""):
-        sku = m.group(1).upper()
-        if sku not in out:
-            out.append(sku)
-        if len(out) >= limit:
-            break
-    return out
-
-
-_ORDER_STATUS_IN_MESSAGE = re.compile(
-    r"\b(draft|submitted|approved|fulfilled|cancelled)\b",
-    re.IGNORECASE,
-)
-
-
-def _order_status_from_message(text: str) -> str | None:
-    m = _ORDER_STATUS_IN_MESSAGE.search(text or "")
-    return m.group(1).lower() if m else None
-
-
-_UUID_IN_MESSAGE = re.compile(
-    r"\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b",
-    re.IGNORECASE,
-)
-
-
-def _order_ids_for_lookup(text: str, session_customer_id: str, *, limit: int = 3) -> list[str]:
-    """UUIDs in the message that are not the session customer id (those are usually order ids)."""
-    sn = session_customer_id.strip().lower()
-    out: list[str] = []
-    for m in _UUID_IN_MESSAGE.finditer(text or ""):
-        uid = m.group(1).lower()
-        if uid == sn:
-            continue
-        if uid not in out:
-            out.append(uid)
-        if len(out) >= limit:
-            break
-    return out
-
-
-def _search_query_candidate(text: str) -> str | None:
-    """
-    Derive a catalog search string from the user message.
-
-    SKU tokens are removed when other words remain so searches lean on product language;
-    if the message is only SKUs, the raw text is still used (partial name match on server).
-    """
-    raw = (text or "").strip()
-    if not raw:
-        return None
-    sans_skus = _SKU_IN_MESSAGE.sub(" ", raw)
-    sans_skus = " ".join(sans_skus.split()).strip()
-    candidate = sans_skus if sans_skus else raw
-    return candidate[:200] if candidate else None
-
-
-def mock_reply(customer_id: str, user_message: str = "") -> str:
-    """Demo reply: profile, orders, order UUID detail, optional ``ORDER_SUBMIT:`` (env), SKUs, search, catalog."""
-    from meridian.tools.create_order import (
-        CreateOrderCustomerNotFoundError,
-        CreateOrderInsufficientInventoryError,
-        CreateOrderMCPError,
-        CreateOrderProductNotFoundError,
-        CreateOrderValidationError,
-        fetch_create_order,
-        parse_order_submit_payload,
-    )
-    from meridian.tools.get_customer import (
-        GetCustomerAccessError,
-        GetCustomerMCPError,
-        GetCustomerNotFoundError,
-        GetCustomerValidationError,
-        fetch_get_customer,
-    )
-    from meridian.tools.get_order import (
-        GetOrderAccessError,
-        GetOrderMCPError,
-        GetOrderNotFoundError,
-        GetOrderValidationError,
-        fetch_get_order,
-    )
-    from meridian.tools.get_product import (
-        GetProductMCPError,
-        GetProductNotFoundError,
-        GetProductValidationError,
-        fetch_get_product,
-    )
-    from meridian.tools.list_orders import (
-        ListOrdersMCPError,
-        ListOrdersValidationError,
-        fetch_list_orders,
-    )
-    from meridian.tools.list_products import (
-        ListProductsMCPError,
-        ListProductsValidationError,
-        fetch_list_products,
-    )
-    from meridian.tools.search_products import (
-        SearchProductsMCPError,
-        SearchProductsValidationError,
-        fetch_search_products,
-    )
-
-    profile_block = ""
-    try:
-        prof = fetch_get_customer(acting_customer_id=customer_id)
-        pclip = prof[:3500] + ("…" if len(prof) > 3500 else "")
-        profile_block = f"**Your profile**\n\n```text\n{pclip}\n```\n\n---\n\n"
-    except GetCustomerValidationError as exc:
-        profile_block = f"**Your profile** — {exc}\n\n---\n\n"
-   
-    except GetCustomerNotFoundError as exc:
-        profile_block = f"**Your profile** — {exc}\n\n---\n\n"
-    except GetCustomerMCPError as exc:
-        profile_block = f"**Your profile** — {exc}\n\n---\n\n"
-    except MCPAuthRequired as exc:
-        profile_block = f"**Your profile** — {exc}\n\n---\n\n"
-    except Exception as exc:  # noqa: BLE001
-        profile_block = f"**Your profile** — {type(exc).__name__}\n\n---\n\n"
-
-    orders_block = ""
-    order_status = _order_status_from_message(user_message)
-    try:
-        orders = fetch_list_orders(
-            acting_customer_id=customer_id,
-            customer_id=None,
-            status=order_status,
-        )
-        oclip = orders[:4500] + ("…" if len(orders) > 4500 else "")
-        status_note = f" (status: **{order_status}**)" if order_status else ""
-        orders_block = f"**Your orders**{status_note}\n\n```text\n{oclip}\n```\n\n---\n\n"
-    except ListOrdersValidationError as exc:
-        orders_block = f"**Your orders** — {exc}\n\n---\n\n"
-    except GetCustomerAccessError as exc:
-        orders_block = f"**Your orders** — {exc}\n\n---\n\n"
-    except GetCustomerValidationError as exc:
-        orders_block = f"**Your orders** — {exc}\n\n---\n\n"
-    except ListOrdersMCPError as exc:
-        orders_block = f"**Your orders** — {exc}\n\n---\n\n"
-    except MCPAuthRequired as exc:
-        orders_block = f"**Your orders** — {exc}\n\n---\n\n"
-    except Exception as exc:  # noqa: BLE001
-        orders_block = f"**Your orders** — {type(exc).__name__}\n\n---\n\n"
-
-    order_detail_blocks: list[str] = []
-    for oid in _order_ids_for_lookup(user_message, customer_id):
-        try:
-            odetail = fetch_get_order(acting_customer_id=customer_id, order_id=oid)
-            oclip = odetail[:5000] + ("…" if len(odetail) > 5000 else "")
-            order_detail_blocks.append(f"**Order `{oid}`**\n\n```text\n{oclip}\n```")
-        except GetOrderValidationError as exc:
-            order_detail_blocks.append(f"**Order `{oid}`** — {exc}")
-        except GetOrderNotFoundError as exc:
-            order_detail_blocks.append(f"**Order `{oid}`** — {exc}")
-        except GetOrderAccessError as exc:
-            order_detail_blocks.append(f"**Order `{oid}`** — {exc}")
-        except GetOrderMCPError as exc:
-            order_detail_blocks.append(f"**Order `{oid}`** — {exc}")
-        except MCPAuthRequired as exc:
-            order_detail_blocks.append(f"**Order `{oid}`** — {exc}")
-        except Exception as exc:  # noqa: BLE001
-            order_detail_blocks.append(f"**Order `{oid}`** — {type(exc).__name__}")
-
-    order_detail_section = ""
-    if order_detail_blocks:
-        order_detail_section = (
-            "**Order detail** (UUIDs in your message)\n\n"
-            + "\n\n".join(order_detail_blocks)
-            + "\n\n---\n\n"
-        )
-
-    submit_block = ""
-    if (os.environ.get("MERIDIAN_ENABLE_ORDER_SUBMIT") or "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-    ):
-        raw_submit = parse_order_submit_payload(user_message)
-        if raw_submit:
-            try:
-                confirmation = fetch_create_order(
-                    acting_customer_id=customer_id,
-                    items=raw_submit,
-                )
-                cclip = confirmation[:6000] + ("…" if len(confirmation) > 6000 else "")
-                submit_block = (
-                    "**Order placed** (`ORDER_SUBMIT:` line — real MCP write)\n\n"
-                    f"```text\n{cclip}\n```\n\n---\n\n"
-                )
-            except CreateOrderValidationError as exc:
-                submit_block = f"**Order submit** — {exc}\n\n---\n\n"
-            except CreateOrderInsufficientInventoryError as exc:
-                submit_block = f"**Order submit** — {exc}\n\n---\n\n"
-            except CreateOrderProductNotFoundError as exc:
-                submit_block = f"**Order submit** — {exc}\n\n---\n\n"
-            except CreateOrderCustomerNotFoundError as exc:
-                submit_block = f"**Order submit** — {exc}\n\n---\n\n"
-            except CreateOrderMCPError as exc:
-                submit_block = f"**Order submit** — {exc}\n\n---\n\n"
-            except GetCustomerAccessError as exc:
-                submit_block = f"**Order submit** — {exc}\n\n---\n\n"
-            except MCPAuthRequired as exc:
-                submit_block = f"**Order submit** — {exc}\n\n---\n\n"
-            except Exception as exc:  # noqa: BLE001
-                submit_block = f"**Order submit** — {type(exc).__name__}\n\n---\n\n"
-
-    sku_blocks: list[str] = []
-    for sku in _skus_from_user_message(user_message):
-        try:
-            detail = fetch_get_product(acting_customer_id=customer_id, sku=sku)
-            clip = detail[:4000] + ("…" if len(detail) > 4000 else "")
-            sku_blocks.append(f"**{sku}**\n```text\n{clip}\n```")
-        except GetProductValidationError as exc:
-            sku_blocks.append(f"**{sku}** — {exc}")
-        except GetProductNotFoundError as exc:
-            sku_blocks.append(f"**{sku}** — {exc}")
-        except GetProductMCPError as exc:
-            sku_blocks.append(f"**{sku}** — {exc}")
-        except MCPAuthRequired as exc:
-            sku_blocks.append(f"**{sku}** — {exc}")
-
-    search_block = ""
-    sq = _search_query_candidate(user_message)
-    if sq:
-        try:
-            hits = fetch_search_products(acting_customer_id=customer_id, query=sq)
-            clip = hits[:3500] + ("…" if len(hits) > 3500 else "")
-            search_block = (
-                f"**Search** (\"{sq[:80]}{'…' if len(sq) > 80 else ''}\")\n\n"
-                f"```text\n{clip}\n```\n\n---\n\n"
-            )
-        except SearchProductsValidationError as exc:
-            search_block = f"**Search** — {exc}\n\n---\n\n"
-        except MCPAuthRequired as exc:
-            search_block = f"**Search** — {exc}\n\n---\n\n"
-        except SearchProductsMCPError as exc:
-            search_block = f"**Search** — {exc}\n\n---\n\n"
-        except Exception as exc:  # noqa: BLE001
-            search_block = f"**Search** — {type(exc).__name__}\n\n---\n\n"
-
-    try:
-        inv = fetch_list_products(
-            acting_customer_id=customer_id,
-            category=None,
-            is_active=None,
-        )
-        inv_preview = inv[:900] + ("…" if len(inv) > 900 else "")
-    except ListProductsValidationError as exc:
-        inv_preview = str(exc)
-    except MCPAuthRequired as exc:
-        inv_preview = str(exc)
-    except ListProductsMCPError as exc:
-        inv_preview = str(exc)
-    except Exception as exc:  # noqa: BLE001
-        inv_preview = f"Couldn't load inventory ({type(exc).__name__})."
-
-    intro = (
-        "We're not answering end-to-end yet—this build still routes through a demo path. "
-        "Below is live data for your signed-in session (profile, orders, catalog)."
-    )
-    sku_section = ""
-    if sku_blocks:
-        sku_section = "**SKU lookup** (from your message)\n\n" + "\n\n".join(sku_blocks) + "\n\n---\n\n"
-    list_section = f"**In-stock snapshot**\n\n```text\n{inv_preview}\n```"
-    return (
-        intro
-        + "\n\n"
-        + profile_block
-        + orders_block
-        + order_detail_section
-        + submit_block
-        + sku_section
-        + search_block
-        + list_section
-    )
-
-
 def _sidebar_signed_in(customer):
     st.sidebar.header("Account")
     st.sidebar.success(f"**{customer.display_name}**")
@@ -375,8 +94,8 @@ def _sidebar_signed_in(customer):
 
 def _sidebar_auth_gate():
     st.sidebar.header("Account")
-  
-    if not (os.environ.get("OPENAI_API_KEY") or "").strip():
+
+    if not _openai_configured():
         st.sidebar.warning("Add `OPENAI_API_KEY` to `.env` to turn on chat-based sign-in.")
 
 
@@ -388,7 +107,7 @@ def _render_auth_chat():
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    if not (os.environ.get("OPENAI_API_KEY") or "").strip():
+    if not _openai_configured():
         st.error("Chat sign-in is off until `OPENAI_API_KEY` is set in your environment.")
         return
 
@@ -465,11 +184,17 @@ def main():
         with st.expander("Reference ID (for tickets)"):
             st.code(customer.customer_id)
 
+        if not _openai_configured():
+            st.warning(
+                "Support chat needs **`OPENAI_API_KEY`** (same key as sign-in). "
+                "Add it to `.env` and reload this page."
+            )
+
         for message in st.session_state.messages:
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
 
-        if prompt := st.chat_input("How can we help?"):
+        if prompt := st.chat_input("How can we help?", disabled=not _openai_configured()):
             with trace_scope(new_trace_id()):
                 st.session_state.messages.append({"role": "user", "content": prompt})
                 with st.chat_message("user"):
@@ -502,7 +227,19 @@ def main():
                         st.write_stream(stream_text(reply))
                     st.session_state.messages.append({"role": "assistant", "content": reply})
                 else:
-                    reply = mock_reply(customer.customer_id, prompt)
+                    try:
+                        turn = run_support_agent_turn(
+                            st.session_state.messages,
+                            acting_customer_id=customer.customer_id,
+                        )
+                        reply = turn.reply_markdown
+                    except RuntimeError as exc:
+                        reply = f"Setup issue: {exc}"
+                    except Exception as exc:  # noqa: BLE001
+                        reply = (
+                            f"Support agent hit an error ({type(exc).__name__}). "
+                            "Check `OPENAI_API_KEY` and MCP connectivity, then try again."
+                        )
                     with st.chat_message("assistant"):
                         st.write_stream(stream_text(reply))
                     st.session_state.messages.append({"role": "assistant", "content": reply})

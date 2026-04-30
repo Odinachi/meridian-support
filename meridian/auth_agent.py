@@ -15,7 +15,7 @@ from agents.tool import function_tool
 from meridian.auth import AuthError, verify_customer_pin
 from meridian.auth_audit import email_domain_only
 from meridian.observability import get_trace_id, log_tool_event
-from meridian.models import CustomerPrincipal, MeridianAuthContext
+from meridian.models import AuthAgentResponse, MeridianAuthContext
 
 _LOG = logging.getLogger("meridian.auth_agent")
 
@@ -31,6 +31,9 @@ Call `submit_meridian_credentials` once you have both. If it fails, say somethin
 Until verification succeeds, don’t answer product, order, or shipping questions; say they’ll get that right after sign-in.
 
 Never invent a PIN or read one back aloud in full. Keep answers short.
+
+**Final output (required structured object)**
+- `reply_markdown`: your full visible message for the customer (markdown).
 """
 
 
@@ -101,6 +104,7 @@ def build_auth_agent() -> Agent[MeridianAuthContext]:
         instructions=AUTH_AGENT_INSTRUCTIONS,
         tools=[submit_meridian_credentials],
         model=model,
+        output_type=AuthAgentResponse,
     )
 
 
@@ -144,8 +148,13 @@ def run_auth_agent_turn(
         context=context,
         max_turns=16,
     )
-    out = result.final_output
-    text = out if isinstance(out, str) else str(out)
+    parsed = result.final_output_as(AuthAgentResponse, raise_if_incorrect_type=False)
+    if parsed is not None:
+        text = parsed.reply_markdown
+    else:
+        out = result.final_output
+        text = out if isinstance(out, str) else str(out)
+        text = (text or "").strip() or "(empty)"
     log_tool_event(
         _LOG,
         logging.INFO,
@@ -156,6 +165,7 @@ def run_auth_agent_turn(
             "trace": trace,
             "reply_chars": len(text),
             "pending_verified": context.pending_principal is not None,
+            "structured_parse_ok": parsed is not None,
         },
     )
     return text

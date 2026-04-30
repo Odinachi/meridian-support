@@ -1,5 +1,7 @@
 import pytest
 
+from meridian.auth_agent import build_auth_agent
+from meridian.models import AuthAgentResponse
 from meridian.auth import (
     AuthError,
     normalize_email,
@@ -12,6 +14,16 @@ from meridian.principal import (
     principal_from_session_dict,
     principal_to_session_dict,
 )
+
+
+def test_auth_agent_response_model():
+    r = AuthAgentResponse(reply_markdown="Hi")
+    assert r.reply_markdown == "Hi"
+
+
+def test_build_auth_agent_structured_output():
+    agent = build_auth_agent()
+    assert agent.output_type is AuthAgentResponse
 
 
 def test_normalize_email():

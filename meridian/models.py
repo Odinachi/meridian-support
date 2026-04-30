@@ -33,6 +33,44 @@ class MeridianAuthContext(BaseModel):
     last_tool_user_visible: str | None = Field(default=None, repr=False)
 
 
+class AuthAgentResponse(BaseModel):
+    """Structured final output from the sign-in agent (OpenAI Agents ``output_type``)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reply_markdown: str = Field(
+        ...,
+        min_length=1,
+        max_length=16_000,
+        description="What the customer sees next in the sign-in chat (markdown).",
+    )
+
+
+class SupportAgentContext(BaseModel):
+    """Per-turn context for the signed-in support agent (MCP calls scoped to this customer)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    acting_customer_id: str
+
+
+class SupportAgentResponse(BaseModel):
+    """Structured final output from the support agent (OpenAI Agents ``output_type``)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reply_markdown: str = Field(
+        ...,
+        min_length=1,
+        max_length=48_000,
+        description="Complete customer-visible answer in GitHub-flavored markdown.",
+    )
+    tools_were_used: bool = Field(
+        default=False,
+        description="True if meridian_* tools were called this turn to obtain facts.",
+    )
+
+
 class OrderLineItem(BaseModel):
     """One catalog line on a create-order request (after normalization)."""
 
