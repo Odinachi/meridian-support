@@ -1,0 +1,7 @@
+# Production image dependencies (no test tools).
+pydantic>=2.7.0
+streamlit>=1.33.0
+mcp[cli]>=1.8.0
+uvicorn[standard]>=0.30.0
+python-dotenv>=1.0.0
+openai-agents>=0.14.0

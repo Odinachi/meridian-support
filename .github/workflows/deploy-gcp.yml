@@ -1,0 +1,157 @@
+# Deploy Streamlit app to Google Cloud Run using Workload Identity Federation (no JSON keys).
+#
+# Required GitHub repository variables (Settings → Secrets and variables → Actions → Variables):
+#   GCP_PROJECT_ID              e.g. my-project-123
+#   GCP_REGION                  e.g. us-central1
+#   GCP_ARTIFACT_REPOSITORY     Artifact Registry Docker repo id (create in console)
+#   GCP_WORKLOAD_IDENTITY_PROVIDER  full provider resource name, e.g.
+#       projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/github-pool/providers/github
+#   GCP_SERVICE_ACCOUNT_EMAIL   deployer SA email, e.g. github-deploy@PROJECT.iam.gserviceaccount.com
+#   CLOUD_RUN_SERVICE             service name, e.g. meridian-support
+#
+# Optional variables:
+#   GCP_OPENAI_SECRET_NAME        Secret Manager *secret id* (not value) in the same project, e.g. openai-api-key
+#                                 If set, deploy passes --set-secrets=OPENAI_API_KEY=SECRET_NAME:latest
+#
+# One-time GCP setup: see DEPLOY_GCP.md
+
+name: Deploy to GCP (Cloud Run)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-gcp-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  IMAGE_NAME: meridian
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests
+        run: pytest tests/ -q --tb=short
+
+  deploy:
+    name: Build and deploy
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate required variables
+        shell: bash
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          GCP_ARTIFACT_REPOSITORY: ${{ vars.GCP_ARTIFACT_REPOSITORY }}
+          GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          GCP_SERVICE_ACCOUNT_EMAIL: ${{ vars.GCP_SERVICE_ACCOUNT_EMAIL }}
+          CLOUD_RUN_SERVICE: ${{ vars.CLOUD_RUN_SERVICE }}
+        run: |
+          set -euo pipefail
+          missing=()
+          for name in GCP_PROJECT_ID GCP_REGION GCP_ARTIFACT_REPOSITORY GCP_WORKLOAD_IDENTITY_PROVIDER GCP_SERVICE_ACCOUNT_EMAIL CLOUD_RUN_SERVICE; do
+            eval "val=\${$name:-}"
+            if [[ -z "${val}" ]]; then
+              missing+=("$name")
+            fi
+          done
+          if ((${#missing[@]})); then
+            echo "::error::Missing GitHub Actions variables: ${missing[*]}. See workflow header and DEPLOY_GCP.md."
+            exit 1
+          fi
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT_EMAIL }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      - name: Configure Docker for Artifact Registry
+        run: |
+          set -euo pipefail
+          gcloud auth configure-docker "${{ vars.GCP_REGION }}-docker.pkg.dev" --quiet
+
+      - name: Build container image
+        run: |
+          set -euo pipefail
+          REGISTRY="${{ vars.GCP_REGION }}-docker.pkg.dev"
+          URI="${REGISTRY}/${{ vars.GCP_PROJECT_ID }}/${{ vars.GCP_ARTIFACT_REPOSITORY }}/${{ env.IMAGE_NAME }}"
+          SHA_TAG="${URI}:${GITHUB_SHA}"
+          LATEST_TAG="${URI}:latest"
+          docker build \
+            --tag "${SHA_TAG}" \
+            --tag "${LATEST_TAG}" \
+            .
+          docker push "${SHA_TAG}"
+          docker push "${LATEST_TAG}"
+          {
+            echo "IMAGE_URI=${SHA_TAG}"
+            echo "REGISTRY_URI=${URI}"
+          } >> "${GITHUB_ENV}"
+
+      - name: Deploy to Cloud Run
+        shell: bash
+        env:
+          GCP_OPENAI_SECRET_NAME: ${{ vars.GCP_OPENAI_SECRET_NAME }}
+        run: |
+          set -euo pipefail
+          cmd=(
+            gcloud run deploy "${{ vars.CLOUD_RUN_SERVICE }}"
+            --image "${IMAGE_URI}"
+            --region "${{ vars.GCP_REGION }}"
+            --project "${{ vars.GCP_PROJECT_ID }}"
+            --platform managed
+            --allow-unauthenticated
+            --port 8080
+            --memory 2Gi
+            --cpu 1
+            --concurrency 1
+            --timeout 900
+            --min-instances 0
+            --max-instances 5
+            --session-affinity
+            --quiet
+          )
+          if [[ -n "${GCP_OPENAI_SECRET_NAME:-}" ]]; then
+            cmd+=(--set-secrets="OPENAI_API_KEY=${GCP_OPENAI_SECRET_NAME}:latest")
+          fi
+          "${cmd[@]}"
+
+      - name: Show service URL
+        run: |
+          set -euo pipefail
+          gcloud run services describe "${{ vars.CLOUD_RUN_SERVICE }}" \
+            --region "${{ vars.GCP_REGION }}" \
+            --project "${{ vars.GCP_PROJECT_ID }}" \
+            --format 'value(status.url)'
