@@ -1,5 +1,4 @@
 import os
-from functools import lru_cache
 
 
 def _strip_optional_quotes(value: str) -> str:
@@ -9,7 +8,6 @@ def _strip_optional_quotes(value: str) -> str:
     return v
 
 
-@lru_cache
 def get_mcp_url() -> str:
     """Remote MCP endpoint (Streamable HTTP)."""
     url = os.environ.get("MCP_SERVER_URL") or os.environ.get("MCP_URL")
