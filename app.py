@@ -110,7 +110,14 @@ def _search_query_candidate(text: str) -> str | None:
 
 
 def mock_reply(customer_id: str, user_message: str = "") -> str:
-    """Demo reply: ``get_product`` for SKUs, ``search_products`` for text, ``list_products`` snapshot."""
+    """Demo reply: profile, SKUs, search, and catalog snapshot (all guarded MCP)."""
+    from meridian.tools.get_customer import (
+        GetCustomerAccessError,
+        GetCustomerMCPError,
+        GetCustomerNotFoundError,
+        GetCustomerValidationError,
+        fetch_get_customer,
+    )
     from meridian.tools.get_product import (
         GetProductMCPError,
         GetProductNotFoundError,
@@ -127,6 +134,24 @@ def mock_reply(customer_id: str, user_message: str = "") -> str:
         SearchProductsValidationError,
         fetch_search_products,
     )
+
+    profile_block = ""
+    try:
+        prof = fetch_get_customer(acting_customer_id=customer_id)
+        pclip = prof[:3500] + ("…" if len(prof) > 3500 else "")
+        profile_block = f"**Your profile**\n\n```text\n{pclip}\n```\n\n---\n\n"
+    except GetCustomerValidationError as exc:
+        profile_block = f"**Your profile** — {exc}\n\n---\n\n"
+    except GetCustomerAccessError as exc:
+        profile_block = f"**Your profile** — {exc}\n\n---\n\n"
+    except GetCustomerNotFoundError as exc:
+        profile_block = f"**Your profile** — {exc}\n\n---\n\n"
+    except GetCustomerMCPError as exc:
+        profile_block = f"**Your profile** — {exc}\n\n---\n\n"
+    except MCPAuthRequired as exc:
+        profile_block = f"**Your profile** — {exc}\n\n---\n\n"
+    except Exception as exc:  # noqa: BLE001
+        profile_block = f"**Your profile** — {type(exc).__name__}\n\n---\n\n"
 
     sku_blocks: list[str] = []
     for sku in _skus_from_user_message(user_message):
@@ -180,13 +205,13 @@ def mock_reply(customer_id: str, user_message: str = "") -> str:
 
     intro = (
         "We're not answering end-to-end yet—this build still routes through a demo path. "
-        "Below is live catalog data for your signed-in session."
+        "Below is live data for your signed-in session (profile + catalog)."
     )
     sku_section = ""
     if sku_blocks:
         sku_section = "**SKU lookup** (from your message)\n\n" + "\n\n".join(sku_blocks) + "\n\n---\n\n"
     list_section = f"**In-stock snapshot**\n\n```text\n{inv_preview}\n```"
-    return intro + "\n\n" + sku_section + search_block + list_section
+    return intro + "\n\n" + profile_block + sku_section + search_block + list_section
 
 
 def _sidebar_signed_in(customer):
