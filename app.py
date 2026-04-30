@@ -155,7 +155,7 @@ def _render_auth_chat():
 def main():
     os.environ.setdefault(
         "MCP_SERVER_URL",
-        "https://order-mcp-74afyau24q-uc.a.run.app/mcp",
+        "",
     )
     st.set_page_config(
         page_title="Meridian Support",
